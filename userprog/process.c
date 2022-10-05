@@ -14,7 +14,6 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
-#include "threads/synch.h"
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
@@ -26,24 +25,6 @@
 
 static thread_func start_process NO_RETURN;
 static bool load(const char *cmdline, void(**eip) (void), void **esp);
-
-/*Finds child for thread's child list that matches given tid.
-  If a child is found, returns a pointer to the child, returnsNULL otherwise*/
-static struct thread *
-get_child (tid_t tid)
-{
-  struct list *list = &thread_current ()->child_list;
-  struct list_elem *e;
-
-  for (e = list_begin (list); e != list_end (list); e = list_next (e))
-    {
-      struct thread *t = list_entry (e, struct thread, child_elem);
-      if (tid == t->tid)
-        return t;
-    }
-
-  return NULL;
-}
 
 /* Starts a new thread running a user program loaded from
  * FILENAME.  The new thread may be scheduled (and may even exit)
@@ -73,23 +54,8 @@ process_execute(const char *file_name)
     tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
     if (tid == TID_ERROR) {
         palloc_free_page(fn_copy);
-        return TID_ERROR;
     }
-    
-
-
-// Block parent process until child finishes loading
-struct thread *child = get_child (tid);
-  if (child) 
-  {
-    sema_down (&child->load_sema);
-
-    if(child->exit_status == -1)
-    {
-      list_remove (&child->child_elem);
-    }
-  }
-  return (child->exit_status == -1) ? TID_ERROR : tid;
+    return tid;
 }
 
 /* A thread function that loads a user process and starts it
@@ -109,12 +75,6 @@ start_process(void *file_name_)
     if_.cs = SEL_UCSEG;
     if_.eflags = FLAG_IF | FLAG_MBS;
     success = load(file_name, &if_.eip, &if_.esp);
-
-    // Store exit status, -1 if error loading
-    thread_current ()->exit_status = (success) ? 0 : -1;
-
-    // Unblock parent once finished loading
-    sema_up (&thread_current()->load_sema);
 
     /* If load failed, quit. */
     palloc_free_page(file_name);
@@ -142,20 +102,9 @@ start_process(void *file_name_)
  * This function will be implemented in problem 2-2.  For now, it
  * does nothing. */
 int
-process_wait(tid_t child_tid)
+process_wait(tid_t child_tid UNUSED)
 {
-    struct thread *child = get_child (child_tid);
-    if (!child)
     return -1;
-
-    // Wait for process with child_tid to run
-    sema_down (&child->exit_sema);
-    int exit_status = child->exit_status;
-  
-    // Reap the child
-    sema_up (&child->reap_sema);
-    list_remove (&child->child_elem);
-    return exit_status;
 }
 
 /* Free the current process's resources. */
@@ -259,7 +208,7 @@ struct Elf32_Phdr {
 #define PF_W 2 /* Writable. */
 #define PF_R 4 /* Readable. */
 
-static bool setup_stack(void **esp, const char *command_line);
+static bool setup_stack(void **esp);
 
 static bool validate_segment(const struct Elf32_Phdr *, struct file *);
 static bool load_segment(struct file *file, off_t ofs, uint8_t *upage, uint32_t read_bytes, uint32_t zero_bytes, bool writable);
@@ -269,7 +218,7 @@ static bool load_segment(struct file *file, off_t ofs, uint8_t *upage, uint32_t 
  * and its initial stack pointer into *ESP.
  * Returns true if successful, false otherwise. */
 bool
-load(const char *command_line, void(**eip) (void), void **esp)
+load(const char *file_name, void(**eip) (void), void **esp)
 {
     log(L_TRACE, "load()");
     struct thread *t = thread_current();
@@ -278,7 +227,6 @@ load(const char *command_line, void(**eip) (void), void **esp)
     off_t file_ofs;
     bool success = false;
     int i;
-    char *cmd_line_copy = NULL;
 
     /* Allocate and activate page directory. */
     t->pagedir = pagedir_create();
@@ -286,15 +234,6 @@ load(const char *command_line, void(**eip) (void), void **esp)
         goto done;
     }
     process_activate();
-
-    /*Separate file name from arguments*/
-    char *delimiter = " ";
-    char *save_ptr;
-    cmd_line_copy = (char *) palloc_get_page(PAL_USER | PAL_ZERO);
-    strlcpy(cmd_line_copy, command_line, strlen(command_line) + 1);
-    char *file_name = strtok_r(cmd_line_copy, delimiter, &save_ptr);
-
-    lock_acquire(&filesys_lock);
 
     /* Open executable file. */
     file = filesys_open(file_name);
@@ -372,7 +311,7 @@ load(const char *command_line, void(**eip) (void), void **esp)
     }
 
     /* Set up stack. */
-    if (!setup_stack(esp, command_line)) {
+    if (!setup_stack(esp)) {
         goto done;
     }
 
@@ -381,17 +320,9 @@ load(const char *command_line, void(**eip) (void), void **esp)
 
     success = true;
 
-    //Deny writes on executing files
-    file_deny_write (file);
-    thread_current ()->executable = file;
-
 done:
     /* We arrive here whether the load is successful or not. */
-    palloc_free_page (cmd_line_copy);
-    if(filesys_lock.holder == thread_current ())
-    {
-        lock_release(&filesys_lock);
-    }
+    file_close(file);
     return success;
 }
 
@@ -510,124 +441,27 @@ load_segment(struct file *file, off_t ofs, uint8_t *upage,
     }
     return true;
 }
-// Helper function to place arguments into the stack
-static void
-*push_arguments(void *esp, int num_arguments, char **arguments)
-{
-  //Push arguments onto stack
-  int index;
-  for (index = 0; index < num_arguments; index++)
-    {
-      int length = strlen (arguments[index]) + 1;
-      esp -= length;
-      memcpy (esp, arguments[index], length);
-    }
 
-  void *arguments_address = esp;
-  // align to multiple of 4
-  const int ALIGNMENT = 4;
-  unsigned int padding = ((unsigned int) esp) % ALIGNMENT;
-  esp -= padding;
-
-  //NULL Sentinel
-  esp -= sizeof(char *);
-  memset (esp, 0, sizeof(char *));
-
-  //Push address of each argument
-  for (index = num_arguments - 1; index >= 0; index--) 
-    {
-      esp -= sizeof(char*);
-      memcpy (esp, &arguments_address, sizeof(char *));
-      arguments_address += (strlen (arguments[index]) + 1);
-    }
-  void *argv_address = esp;
-
-  //Push argv and argc
-  esp -= sizeof(char*);
-  memcpy (esp, &argv_address, sizeof(char *));
-  esp -= sizeof(int);
-  memcpy (esp, &num_arguments, sizeof(int));
-
-  //Return Adress
-  esp -= sizeof(void *);
-  memset (esp, 0, sizeof(void *));
-
-  return esp;
-}
-
-//Iterate through line to find number of arguments
-static int
-count_args (char *cmd_line)
-{
-  char *delimiter = " ";
-  char *save_ptr;
-
-  char *token = strtok_r (cmd_line, delimiter, &save_ptr);
-  int argc = 0;
-
-  while (token)
-  {
-    argc++;
-    token = strtok_r (NULL, delimiter, &save_ptr);
-  }
-
-  return argc;
-}
 /* Create a minimal stack by mapping a zeroed page at the top of
  * user virtual memory. */
 static bool
-setup_stack(void **esp, const char *command_line)
+setup_stack(void **esp)
 {
     uint8_t *kpage;
     bool success = false;
 
     log(L_TRACE, "setup_stack()");
 
-    char *delimiter = " ";
-  char *cmd_line_copy = palloc_get_page (PAL_USER | PAL_ZERO);
-  strlcpy (cmd_line_copy, command_line, strlen (command_line) + 1);
-
-  if (cmd_line_copy == NULL)
-    return false;
-
-  int argc = count_args (cmd_line_copy);
-
-  char *argv[argc];
-  char *save_ptr;
-  palloc_free_page (cmd_line_copy);
-  
-  // Place arguments from command line into a temporary array
-  cmd_line_copy = palloc_get_page (PAL_USER | PAL_ZERO);
-  strlcpy (cmd_line_copy, command_line, strlen (command_line) + 1);
-  argv[0] = strtok_r (cmd_line_copy, delimiter, &save_ptr);
-
-  int stack_size = strlen (argv[0]) + 1;
-  int index;
-  for (index = 1; index < argc; index++) 
-  {
-    argv[index] = strtok_r (NULL, delimiter, &save_ptr);
-    stack_size += (strlen (argv[index]) + 1);
-  }
-  stack_size += (stack_size % sizeof(void *));
-  stack_size += ((argc + 2) * sizeof(void *));
-  if (stack_size > PGSIZE)
-  {
-    palloc_free_page (cmd_line_copy);
-    return success;
-  }
-
     kpage = palloc_get_page(PAL_USER | PAL_ZERO);
     if (kpage != NULL) {
         success = install_page(((uint8_t *)PHYS_BASE) - PGSIZE, kpage, true);
         if (success) {
             *esp = PHYS_BASE;
-            *esp = push_arguments (*esp, argc, argv);
         } else {
             palloc_free_page(kpage);
         }
         // hex_dump( *(int*)esp, *esp, 128, true ); // NOTE: uncomment this to check arg passing
     }
-    palloc_free_page (cmd_line_copy);
     return success;
 }
 

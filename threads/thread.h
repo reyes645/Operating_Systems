@@ -4,7 +4,6 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
-#include "threads/synch.h"
 
 /* States in a thread's life cycle. */
 enum thread_status {
@@ -23,7 +22,6 @@ typedef int tid_t;
 #define PRI_MIN     0  /* Lowest priority. */
 #define PRI_DEFAULT 31 /* Default priority. */
 #define PRI_MAX     63 /* Highest priority. */
-#define MAX_FILES 130  /* Max # of open files per thread*/
 
 /* A kernel thread or user process.
  *
@@ -96,24 +94,11 @@ struct thread {
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir; /* Page directory. */
-    struct file *files[MAX_FILES];      /* List of open files. */
-    struct file *executable;            /* File in use as executable */
-    int next_fd;                        /* Next index to place an open file */
-    int exit_status;                    /* Thread exit status given to parent*/
-    struct list child_list;             /* List of child processes held */
-    struct list_elem child_elem;        /* List element for child list */
-    struct semaphore load_sema;         /* Used to synch child loading*/
-    struct semaphore exit_sema;         /* Used to synch child exiting*/
-    struct semaphore reap_sema;         /* Used to synch child reaping */
 #endif
 
     /* Owned by thread.c. */
     unsigned magic; /* Detects stack overflow. */
 };
-
-#ifdef USERPROG
-   struct lock filesys_lock;  
-#endif
 
 /* If false (default), use round-robin scheduler.
  * If true, use multi-level feedback queue scheduler.
