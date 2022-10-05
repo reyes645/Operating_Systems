@@ -80,6 +80,10 @@ static void schedule(void);
 void thread_schedule_tail(struct thread *prev);
 static tid_t allocate_tid(void);
 
+#ifdef USERPROG
+static void children_continue (void);
+#endif
+
 /* Initializes the threading system by transforming the code
  * that's currently running into a thread.  This can't work in
  * general and it is possible in this case only because loader.S
@@ -99,6 +103,11 @@ thread_init(void)
     ASSERT(intr_get_level() == INTR_OFF);
 
     lock_init(&tid_lock);
+
+    #ifdef USERPROG
+    lock_init (&filesys_lock);
+    #endif
+
     list_init(&ready_list);
     list_init(&all_list);
 
@@ -213,6 +222,13 @@ thread_create(const char *name, int priority,
     sf->eip = switch_entry;
     sf->ebp = 0;
 
+    #ifdef USERPROG
+    /*Add new thread to current thread's child list
+    Make sure idle thread is not added as a child*/
+    if (strcmp (name, "idle"))
+    list_push_back (&thread_current ()->child_list, &t->child_elem);
+    #endif
+
     /* Add to run queue. */
     thread_unblock(t);
 
@@ -290,6 +306,23 @@ thread_tid(void)
     return thread_current()->tid;
 }
 
+/*Makes sure child processes can run after their parent exits*/
+static void
+children_continue (void)
+{
+  struct list *list = &thread_current ()->child_list;
+  struct list_elem *e;
+
+  for (e = list_begin (list); e != list_end (list); e = list_next (e))
+    {
+      struct thread *t = list_entry (e, struct thread, child_elem);
+
+      sema_up(&t->reap_sema);
+
+    }
+  
+}
+
 /* Deschedules the current thread and destroys it.  Never
  * returns to the caller. */
 void
@@ -297,8 +330,44 @@ thread_exit(void)
 {
     ASSERT(!intr_context());
 
+    /*Separate name from args and print exit status*/
+    char *delimiter = " ";
+    char *save_ptr;
+    char *thread_name = strtok_r (thread_current ()->name, delimiter, &save_ptr);
+    printf ("%s: exit(%d)\n", thread_name, thread_current ()->exit_status);
+
 #ifdef USERPROG
     process_exit();
+
+    lock_acquire (&filesys_lock);
+    // Close executable after the process is finished
+    file_close (thread_current ()->executable);
+    thread_current ()->executable = NULL;
+    lock_release (&filesys_lock);
+
+    //Check if process has a parent
+    if (thread_current () != initial_thread && thread_current () != idle_thread) 
+    {
+        //Wait to be reaped by parent
+        sema_up (&thread_current ()->exit_sema);
+        sema_down (&thread_current ()->reap_sema);
+    }
+
+  lock_acquire (&filesys_lock);
+  //Close all open files
+  int index;
+  for (index = 0; index < MAX_FILES; index++) 
+  {
+    if (thread_current ()->files[index] != NULL) 
+    {
+      file_close (thread_current ()->files[index]);
+      thread_current ()->files[index] = NULL;
+    }
+  }
+  lock_release (&filesys_lock);
+  
+  // Run child processes
+  children_continue ();
 #endif
 
     /* Remove thread from all threads list, set our status to dying,
@@ -478,6 +547,14 @@ init_thread(struct thread *t, const char *name, int priority)
     t->stack = (uint8_t *)t + PGSIZE;
     t->priority = priority;
     t->magic = THREAD_MAGIC;
+    t->next_fd = 2;
+
+    #ifdef USERPROG
+    list_init (&t->child_list);
+    sema_init (&t->load_sema, 0);
+    sema_init (&t->exit_sema, 0);
+    sema_init (&t->reap_sema, 0);
+    #endif
 
     old_level = intr_disable();
     list_push_back(&all_list, &t->allelem);
