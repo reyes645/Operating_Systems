@@ -5,6 +5,19 @@
 #include "threads/thread.h"
 #include "userprog/exception.h"
 #include "userprog/gdt.h"
+#include <debug.h>
+#include <string.h>
+#include "threads/interrupt.h"
+#include "threads/thread.h"
+#include "threads/vaddr.h"
+#include "threads/palloc.h"
+#include "userprog/process.h"
+#include "filesys/file.h"
+#include "vm/frame.h"
+#include "vm/swap.h"
+#include "userprog/pagedir.h"
+
+#define STACK_LIMIT (1 << 23)
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -106,6 +119,90 @@ kill(struct intr_frame *f)
     }
 }
 
+// Use clock algorithm to choose a frame to evict,
+// swap out to disk if not already in the file system, and
+// clear from the page table and frame table
+// Returns the pointer to the page evicted
+static void 
+*evict (void)
+{
+  struct frame_entry *frame = frame_table[clock_hand];
+  uint32_t *pd = frame->frame_owner->pagedir;
+  // Choose a frame to evict
+  while (pagedir_is_accessed(pd, frame->upage))
+  {
+    pagedir_set_accessed (pd, frame->upage, false);
+    clock_hand = (clock_hand < (table_size - 1)) ? clock_hand + 1 : 0;
+    frame = frame_table[clock_hand];
+    pd = frame->frame_owner->pagedir;
+  }
+  
+  // Calculate address of page in physical memory
+  void *kpage = (clock_hand * PGSIZE) + base_address;
+  
+  struct sp_entry *page = page_find (frame->frame_owner, frame->upage);
+  // Send contents of kpage into the swap partition
+  if (pagedir_is_dirty (pd, frame->upage))
+  {
+    swap_write(page);
+  } else 
+  {
+    // This data already exists in the file system, simply
+    // update the SPT
+    page_replace (page, NULL, BLOCK_FILESYS);
+  }
+  // Update VM data structures
+  pagedir_clear_page (pd, page->upage);
+  frame_deallocate (kpage);
+  // Zero the page and return to page fault handler
+  memset (kpage, 0, PGSIZE);
+  return kpage;
+}
+// Memory access has been determined to need stack growth,
+// Add a new entry in both the PT and SPT for virtual
+// address UPAGE and physical memory address KPAGE
+// Return true if successful
+static bool
+grow_stack(void *fault_addr, struct sp_entry *page, void *upage, void *kpage)
+{
+  bool success = false;
+  // Check we have not gone over the 8MB stack limit
+  if (fault_addr < (PHYS_BASE - STACK_LIMIT)) {
+    thread_current ()->exit_status = -1; 
+    thread_exit ();
+  }
+  // Update page table
+  success = install_page (upage, kpage, true);
+  pagedir_set_dirty (thread_current ()->pagedir, upage, true);
+  // Update SPT
+  if (success)
+  {
+    page = page_insert (upage, kpage, BLOCK_KERNEL);
+    success = (page != NULL);
+    page_set_writable (page, true);
+  }
+  return success;
+}
+// Memory access is from file system, read file into physical
+// memory address KPAGE
+static void
+read_filesys (struct sp_entry *page, void *kpage)
+{
+  struct file *file = page->file_addr;
+  bool lock_held_previous = lock_held_by_current_thread (&filesys_lock);
+  if (!lock_held_previous)
+  {
+    lock_acquire (&filesys_lock);
+  }
+  // Read file without changing its position
+  file_read_at (file, kpage, page->read_bytes, file_tell(file));
+  if (!lock_held_previous)
+  {
+    lock_release (&filesys_lock);
+  }
+}
+
+
 /* Page fault handler.  This is a skeleton that must be filled in
  * to implement virtual memory.  Some solutions to project 2 may
  * also require modifying this code.
@@ -138,6 +235,8 @@ page_fault(struct intr_frame *f)
      * be assured of reading CR2 before it changed). */
     intr_enable();
 
+    lock_acquire (&vm_lock);
+
     /* Count page faults. */
     page_fault_cnt++;
 
@@ -146,13 +245,68 @@ page_fault(struct intr_frame *f)
     write = (f->error_code & PF_W) != 0;
     user = (f->error_code & PF_U) != 0;
 
-    /* To implement virtual memory, delete the rest of the function
-     * body, and replace it with code that brings in the page to
-     * which fault_addr refers. */
-    printf("Page fault at %p: %s error %s page in %s context.\n",
-           fault_addr,
-           not_present ? "not present" : "rights violation",
-           write ? "writing" : "reading",
-           user ? "user" : "kernel");
-    kill(f);
+    // Get the SPT entry for this faulting address
+    void *upage = fault_addr - ((unsigned int) fault_addr % PGSIZE);
+    struct sp_entry *page = page_find (thread_current (), upage);
+
+    bool success = false;
+    // Determine if stack growth
+    bool stack_growth = (fault_addr >= (f->esp - PUSH_BYTES)) && !page;
+    
+    // Validate the faulting address, address is invalid if writing to a read
+    // only page, if it is from the kernel pool of virtual memory or
+    // the page does not exist in the SPT and is not stack growth
+    if (!not_present || !is_user_vaddr (upage) || (!page && !stack_growth)) {
+        thread_current ()->exit_status = -1;
+        thread_exit ();
+    }
+
+    void *kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+
+    // No more pages left, must choose a page to evict  
+    if (!kpage)
+    {
+        kpage = evict ();
+    }
+
+    // Grow the stack
+    if (stack_growth)
+    {
+        success = grow_stack (fault_addr, page, upage, kpage);
+    }else {
+        // Normal memory access, must bring in data from somewhere on disk
+        bool swapped = false;
+        // Read from the file system
+        if (page->block == BLOCK_FILESYS)
+        {
+        read_filesys (page, kpage);
+        
+        }else if (page->block == BLOCK_SWAP)
+        {
+        // Read from the swap partition
+        swap_read (page, kpage);
+        swapped = true;
+        }
+        // Update the PT and SPT
+        success = install_page (upage, kpage, page->writable)
+                && page_replace (page, kpage, BLOCK_KERNEL);
+
+        // Set this page back to dirty if brought in from swap
+        if (swapped)
+        {
+        pagedir_set_dirty (thread_current ()->pagedir, upage, true);
+        }
+    }
+
+    // Memory failure, free resources and exit
+    if (!success) 
+    {
+        palloc_free_page (kpage);
+        pagedir_clear_page(thread_current ()->pagedir, upage);
+        thread_current ()->exit_status = -1;
+        thread_exit ();
+    }
+    lock_release (&vm_lock);
 }
+
+

@@ -23,6 +23,8 @@
 #include "threads/palloc.h"
 #include "threads/pte.h"
 #include "threads/thread.h"
+#include "vm/frame.h"
+#include "vm/swap.h"
 #ifdef USERPROG
 #include "userprog/exception.h"
 #include "userprog/gdt.h"
@@ -75,6 +77,8 @@ static void locate_block_devices(void);
 
 static void locate_block_device(enum block_type, const char *name);
 #endif
+
+int main (void) NO_RETURN;
 
 /* Pintos main program. */
 int
@@ -131,13 +135,19 @@ main(void)
     filesys_init(format_filesys);
 #endif
 
+    // Initialize virtual memory data structures
+    frame_init ();
+    swap_init ();
+    
     printf("Boot complete.\n");
 
     /* Run actions specified on kernel command line. */
     run_actions(argv);
 
     /* Finish up. */
-    shutdown();
+    shutdown()
+    frame_destroy ();
+    swap_destroy ();
     thread_exit();
 }
 

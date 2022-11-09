@@ -4,7 +4,10 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include <hash.h>
+
 #include "threads/synch.h"
+#include "filesys/file.h"
 
 /* States in a thread's life cycle. */
 enum thread_status {
@@ -24,6 +27,8 @@ typedef int tid_t;
 #define PRI_DEFAULT 31 /* Default priority. */
 #define PRI_MAX     63 /* Highest priority. */
 #define MAX_FILES 130  /* Max # of open files per thread*/
+#define PUSH_BYTES 32  /* Max # of bytes an instruction*/
+                       /*can push below esp*/
 
 /* A kernel thread or user process.
  *
@@ -105,6 +110,8 @@ struct thread {
     struct semaphore load_sema;         /* Used to synch child loading*/
     struct semaphore exit_sema;         /* Used to synch child exiting*/
     struct semaphore reap_sema;         /* Used to synch child reaping */
+    struct hash sup_table;              /* Supplemental Page Table */
+    void *syscall_esp;                  /* Stack pointer changed in syscalls */
 #endif
 
     /* Owned by thread.c. */
@@ -113,6 +120,7 @@ struct thread {
 
 #ifdef USERPROG
    struct lock filesys_lock;  
+   struct lock vm_lock; 
 #endif
 
 /* If false (default), use round-robin scheduler.

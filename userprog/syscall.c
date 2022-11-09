@@ -13,6 +13,7 @@
 #include "devices/input.h"
 #include "filesys/filesys.h"
 #include "filesys/file.h"
+#include "vm/page.h"
 
 
 static void syscall_handler(struct intr_frame *);
@@ -49,6 +50,16 @@ syscall_init(void)
     intr_register_int(0x30, 3, INTR_ON, syscall_handler, "syscall");
 }
 
+// Stack growth is defined as when the program tries to access
+// an address that at least below 32 bytes below the current 
+// stack pointer
+static bool
+stack_growth (void *address) 
+{
+  void *esp = thread_current ()->syscall_esp;
+  return (address >= esp - PUSH_BYTES);
+}
+
 // Validate a pointer, must not be NULL, be in kernel space, or 
 // be in unmapped memory
 static void
@@ -56,7 +67,8 @@ check_pointer (const char *argument)
 {
   uint32_t *page = thread_current ()->pagedir;
   if (argument == NULL || !is_user_vaddr (argument)
-        || !pagedir_get_page (page, argument))
+        || (!page_find (thread_current (), page_address)
+      && !stack_growth ((void *) argument)))
   {
     thread_current ()->exit_status = -1;
     thread_exit ();
@@ -68,7 +80,8 @@ check_pointer (const char *argument)
 static void
 syscall_handler(struct intr_frame *f)
 {
-    check_pointer(f->esp);
+  check_pointer(f->esp);
+  thread_current()->syscall_esp = f->esp;
   void *esp = f->esp;
 
   int call_number = *(int *) esp;

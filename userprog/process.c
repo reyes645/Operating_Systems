@@ -15,10 +15,13 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "threads/synch.h"
+#include "threads/malloc.h"
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
 #include "userprog/tss.h"
+#include "vm/page.h"
+#include "vm/frame.h"
 
 #define LOGGING_LEVEL 6
 
@@ -165,9 +168,18 @@ process_exit(void)
     struct thread *cur = thread_current();
     uint32_t *pd;
 
+    // Reclaim all of a processes resources before exiting
+    if (!lock_held_by_current_thread(&vm_lock))
+    {
+        lock_acquire (&vm_lock);
+    }
+    page_table_destroy ();
+    lock_release (&vm_lock);
+
+    pd = cur->pagedir;
+
     /* Destroy the current process's page directory and switch back
      * to the kernel-only page directory. */
-    pd = cur->pagedir;
     if (pd != NULL) {
         /* Correct ordering here is crucial.  We must set
          * cur->pagedir to NULL before switching page directories,
@@ -371,6 +383,11 @@ load(const char *command_line, void(**eip) (void), void **esp)
         }
     }
 
+    //Deny writes on executing files
+    file_deny_write (file);
+    thread_current ()->executable = file;
+    lock_release(&filesys_lock);
+
     /* Set up stack. */
     if (!setup_stack(esp, command_line)) {
         goto done;
@@ -381,23 +398,16 @@ load(const char *command_line, void(**eip) (void), void **esp)
 
     success = true;
 
-    //Deny writes on executing files
-    file_deny_write (file);
-    thread_current ()->executable = file;
-
 done:
     /* We arrive here whether the load is successful or not. */
     palloc_free_page (cmd_line_copy);
-    if(filesys_lock.holder == thread_current ())
+    if(lock_held_by_current_thread(&filesys_lock))
     {
         lock_release(&filesys_lock);
     }
     return success;
 }
 
-/* load() helpers. */
-
-static bool install_page(void *upage, void *kpage, bool writable);
 
 /* Checks whether PHDR describes a valid, loadable segment in
  * FILE and returns true if so, false otherwise. */
@@ -477,6 +487,7 @@ load_segment(struct file *file, off_t ofs, uint8_t *upage,
     log(L_TRACE, "load_segment()");
 
     file_seek(file, ofs);
+    int total_read = ofs;
     while (read_bytes > 0 || zero_bytes > 0) {
         /* Calculate how to fill this page.
          * We will read PAGE_READ_BYTES bytes from FILE
@@ -484,29 +495,28 @@ load_segment(struct file *file, off_t ofs, uint8_t *upage,
         size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
         size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-        /* Get a page of memory. */
-        uint8_t *kpage = palloc_get_page(PAL_USER);
-        if (kpage == NULL) {
-            return false;
-        }
+         // Create a copy of the struct file pointer and store it as 
+        // the memory address in the SPT
+        struct file *file_copy = file_reopen (file);
+        // Advance the file pointer for the copy
+        file_seek (file_copy, total_read);
 
-        /* Load this page. */
-        if (file_read(file, kpage, page_read_bytes) != (int)page_read_bytes) {
-            palloc_free_page(kpage);
+        // Add to our SPT
+        struct sp_entry *page_entry = 
+            page_insert (upage, (void *) file_copy, BLOCK_FILESYS);
+        if (!page_entry) 
+        {
             return false;
         }
-        memset(kpage + page_read_bytes, 0, page_zero_bytes);
-
-        /* Add the page to the process's address space. */
-        if (!install_page(upage, kpage, writable)) {
-            palloc_free_page(kpage);
-            return false;
-        }
+        page_set_writable (page_entry, writable);
+        page_set_rb (page_entry, page_read_bytes);
 
         /* Advance. */
         read_bytes -= page_read_bytes;
         zero_bytes -= page_zero_bytes;
         upage += PGSIZE;
+        total_read += (page_read_bytes + page_zero_bytes);
+        file_seek (file, total_read);
     }
     return true;
 }
@@ -584,51 +594,53 @@ setup_stack(void **esp, const char *command_line)
     log(L_TRACE, "setup_stack()");
 
     char *delimiter = " ";
-  char *cmd_line_copy = palloc_get_page (PAL_USER | PAL_ZERO);
-  strlcpy (cmd_line_copy, command_line, strlen (command_line) + 1);
+    char *cmd_line_copy = palloc_get_page (PAL_ZERO);
+    strlcpy (cmd_line_copy, command_line, strlen (command_line) + 1);
 
-  if (cmd_line_copy == NULL)
-    return false;
+    if (cmd_line_copy == NULL)
+        return false;
 
-  int argc = count_args (cmd_line_copy);
+    int argc = count_args (cmd_line_copy);
 
-  char *argv[argc];
-  char *save_ptr;
-  palloc_free_page (cmd_line_copy);
-  
-  // Place arguments from command line into a temporary array
-  cmd_line_copy = palloc_get_page (PAL_USER | PAL_ZERO);
-  strlcpy (cmd_line_copy, command_line, strlen (command_line) + 1);
-  argv[0] = strtok_r (cmd_line_copy, delimiter, &save_ptr);
-
-  int stack_size = strlen (argv[0]) + 1;
-  int index;
-  for (index = 1; index < argc; index++) 
-  {
-    argv[index] = strtok_r (NULL, delimiter, &save_ptr);
-    stack_size += (strlen (argv[index]) + 1);
-  }
-  stack_size += (stack_size % sizeof(void *));
-  stack_size += ((argc + 2) * sizeof(void *));
-  if (stack_size > PGSIZE)
-  {
+    char *argv[argc];
+    char *save_ptr;
     palloc_free_page (cmd_line_copy);
-    return success;
-  }
+    
+    // Place arguments from command line into a temporary array
+    cmd_line_copy = palloc_get_page (PAL_ZERO);
+    strlcpy (cmd_line_copy, command_line, strlen (command_line) + 1);
+    argv[0] = strtok_r (cmd_line_copy, delimiter, &save_ptr);
 
-    kpage = palloc_get_page(PAL_USER | PAL_ZERO);
-    if (kpage != NULL) {
-        success = install_page(((uint8_t *)PHYS_BASE) - PGSIZE, kpage, true);
-        if (success) {
-            *esp = PHYS_BASE;
-            *esp = push_arguments (*esp, argc, argv);
-        } else {
-            palloc_free_page(kpage);
-        }
-        // hex_dump( *(int*)esp, *esp, 128, true ); // NOTE: uncomment this to check arg passing
+    int index;
+    for (index = 1; index < argc; index++) 
+    {
+        argv[index] = strtok_r (NULL, delimiter, &save_ptr);
     }
-    palloc_free_page (cmd_line_copy);
-    return success;
+
+    // Get a page for the top of the stack, add a supplemental
+    // page table entry for it, and install it into a frame
+    lock_acquire (&vm_lock);
+    kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+    if (kpage != NULL) 
+        {
+        uint8_t *upage = ((uint8_t *) PHYS_BASE) - PGSIZE;
+        struct sp_entry *page_entry = page_insert (upage, kpage, BLOCK_KERNEL);
+        success = install_page (upage, kpage, true) && (page_entry != NULL);
+        if (success) 
+            {
+                *esp = PHYS_BASE;
+                *esp = push_arguments (*esp, argc, argv);
+                page_set_writable(page_entry, true);
+            } else 
+            {
+            frame_deallocate(kpage);
+            palloc_free_page (kpage);
+            free(page_entry);
+            }
+        }
+        lock_release (&vm_lock);
+        palloc_free_page (cmd_line_copy);
+        return success;
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel
@@ -640,13 +652,14 @@ setup_stack(void **esp, const char *command_line)
  * with palloc_get_page().
  * Returns true on success, false if UPAGE is already mapped or
  * if memory allocation fails. */
-static bool
+bool
 install_page(void *upage, void *kpage, bool writable)
 {
     struct thread *t = thread_current();
 
     /* Verify that there's not already a page at that virtual
-     * address, then map our page there. */
-    return pagedir_get_page(t->pagedir, upage) == NULL
-           && pagedir_set_page(t->pagedir, upage, kpage, writable);
+     * address. Also allocate a frame for the page*/
+    return (pagedir_get_page (t->pagedir, upage) == NULL
+            && pagedir_set_page (t->pagedir, upage, kpage, writable))
+            && frame_allocate (upage, kpage);
 }

@@ -12,6 +12,8 @@
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "vm/page.h"
+
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -106,6 +108,7 @@ thread_init(void)
 
     #ifdef USERPROG
     lock_init (&filesys_lock);
+    lock_init (&vm_lock);
     #endif
 
     list_init(&ready_list);
@@ -232,6 +235,11 @@ thread_create(const char *name, int priority,
     /* Add to run queue. */
     thread_unblock(t);
 
+    #ifdef USERPROG
+    // Initialize SPT
+    page_init (&t->sup_table);
+    #endif
+
     return tid;
 }
 
@@ -339,7 +347,10 @@ thread_exit(void)
 #ifdef USERPROG
     process_exit();
 
+    if (!lock_held_by_current_thread(&filesys_lock)) {
     lock_acquire (&filesys_lock);
+    }
+    
     // Close executable after the process is finished
     file_close (thread_current ()->executable);
     thread_current ()->executable = NULL;
