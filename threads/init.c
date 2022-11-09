@@ -145,9 +145,9 @@ main(void)
     run_actions(argv);
 
     /* Finish up. */
-    shutdown()
-    frame_destroy ();
-    swap_destroy ();
+    shutdown();
+    frame_destroy();
+    swap_destroy();
     thread_exit();
 }
 

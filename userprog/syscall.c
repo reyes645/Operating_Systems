@@ -65,7 +65,7 @@ stack_growth (void *address)
 static void
 check_pointer (const char *argument)
 {
-  uint32_t *page = thread_current ()->pagedir;
+  void *page_address = (void *) argument - ((unsigned int) argument % PGSIZE);
   if (argument == NULL || !is_user_vaddr (argument)
         || (!page_find (thread_current (), page_address)
       && !stack_growth ((void *) argument)))
