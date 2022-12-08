@@ -4,7 +4,11 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include <hash.h>
 #include "threads/synch.h"
+#include "filesys/file.h"
+#include "filesys/directory.h"
+
 
 /* States in a thread's life cycle. */
 enum thread_status {
@@ -24,6 +28,7 @@ typedef int tid_t;
 #define PRI_DEFAULT 31 /* Default priority. */
 #define PRI_MAX     63 /* Highest priority. */
 #define MAX_FILES 130  /* Max # of open files per thread*/
+
 
 /* A kernel thread or user process.
  *
@@ -107,13 +112,12 @@ struct thread {
     struct semaphore reap_sema;         /* Used to synch child reaping */
 #endif
 
+    struct dir *cwd;                     /* Thread's current working directory*/
+    
     /* Owned by thread.c. */
     unsigned magic; /* Detects stack overflow. */
 };
 
-#ifdef USERPROG
-   struct lock filesys_lock;  
-#endif
 
 /* If false (default), use round-robin scheduler.
  * If true, use multi-level feedback queue scheduler.

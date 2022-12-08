@@ -12,6 +12,7 @@
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -103,11 +104,6 @@ thread_init(void)
     ASSERT(intr_get_level() == INTR_OFF);
 
     lock_init(&tid_lock);
-
-    #ifdef USERPROG
-    lock_init (&filesys_lock);
-    #endif
-
     list_init(&ready_list);
     list_init(&all_list);
 
@@ -225,8 +221,10 @@ thread_create(const char *name, int priority,
     #ifdef USERPROG
     /*Add new thread to current thread's child list
     Make sure idle thread is not added as a child*/
-    if (strcmp (name, "idle"))
-    list_push_back (&thread_current ()->child_list, &t->child_elem);
+    if (strcmp (name, "idle")){	
+        list_push_back (&thread_current ()->child_list, &t->child_elem);	
+        t->cwd = dir_reopen (thread_current ()->cwd);	
+    }
     #endif
 
     /* Add to run queue. */
@@ -339,12 +337,6 @@ thread_exit(void)
 #ifdef USERPROG
     process_exit();
 
-    lock_acquire (&filesys_lock);
-    // Close executable after the process is finished
-    file_close (thread_current ()->executable);
-    thread_current ()->executable = NULL;
-    lock_release (&filesys_lock);
-
     //Check if process has a parent
     if (thread_current () != initial_thread && thread_current () != idle_thread) 
     {
@@ -353,7 +345,6 @@ thread_exit(void)
         sema_down (&thread_current ()->reap_sema);
     }
 
-  lock_acquire (&filesys_lock);
   //Close all open files
   int index;
   for (index = 0; index < MAX_FILES; index++) 
@@ -364,7 +355,9 @@ thread_exit(void)
       thread_current ()->files[index] = NULL;
     }
   }
-  lock_release (&filesys_lock);
+
+  // close current working directory	
+  dir_close(thread_current()->cwd);
   
   // Run child processes
   children_continue ();

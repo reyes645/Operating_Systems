@@ -216,7 +216,7 @@ block_register(const char *name, enum block_type type,
 static struct block *
 list_elem_to_block(struct list_elem *list_elem)
 {
-    return list_elem != list_end(&all_blocks)
+    return (list_elem != list_end(&all_blocks)
           ? list_entry(list_elem, struct block, list_elem)
-          : NULL;
+          : NULL);
 }

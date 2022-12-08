@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <syscall-nr.h>
+#include <stdbool.h>	
+#include <string.h>
 
 #include "threads/interrupt.h"
 #include "threads/thread.h"
@@ -13,6 +15,10 @@
 #include "devices/input.h"
 #include "filesys/filesys.h"
 #include "filesys/file.h"
+#include "filesys/inode.h"		
+#include "filesys/directory.h"		
+#include "filesys/free-map.h"
+#include "threads/malloc.h"
 
 
 static void syscall_handler(struct intr_frame *);
@@ -31,6 +37,11 @@ static void write_call (struct intr_frame *f, void **esp);
 static void seek_call (struct intr_frame *f, void **esp);
 static void tell_call (struct intr_frame *f, void **esp);
 static void close_call (struct intr_frame *f, void **esp);
+static void chdir_call (struct intr_frame *f, void **esp);	
+static void mkdir_call (struct intr_frame *f, void **esp);	
+static void readdir_call (struct intr_frame *f, void **esp);	
+static void isdir_call (struct intr_frame *f, void **esp);	
+static void inumber_call (struct intr_frame *f, void **esp);
 
 static int init_file (struct file *file);
 static void *get_argument (void **esp);
@@ -40,7 +51,8 @@ static void (*system_calls[]) (struct intr_frame*, void**) =
 {
     halt_call, exit_call, exec_call, wait_call, create_call,
     remove_call, open_call, filesize_call, read_call, write_call,
-    seek_call, tell_call, close_call
+    seek_call, tell_call, close_call, NULL, NULL, chdir_call,	
+    mkdir_call, readdir_call, isdir_call, inumber_call
 };
 
 void
@@ -68,7 +80,7 @@ check_pointer (const char *argument)
 static void
 syscall_handler(struct intr_frame *f)
 {
-    check_pointer(f->esp);
+  check_pointer(f->esp);
   void *esp = f->esp;
 
   int call_number = *(int *) esp;
@@ -119,6 +131,14 @@ init_file (struct file *file)
   }
   
   return -1;
+}
+
+/* Returns true if the file stored at fd is a directory*/	
+static bool	
+is_directory (int fd)	
+{	
+  struct inode *inode = file_get_inode (thread_current ()->files[fd]);	
+  return inode_is_dir (inode);	
 }
 
 /*Get the next four bytes from the stack and return them as a void pointer
@@ -177,9 +197,7 @@ create_call (struct intr_frame *f, void **esp)
   check_pointer (file_name);
   size_t initial_size = *(size_t *) get_argument (esp);
 
-  lock_acquire (&filesys_lock);
   f->eax = filesys_create (file_name, initial_size);
-  lock_release (&filesys_lock);
 }
 
 // Remove file from file system, without closing
@@ -191,9 +209,7 @@ remove_call (struct intr_frame *f, void **esp)
   const char *file_name = *(char **) get_argument (esp);
   check_pointer (file_name);
 
-  lock_acquire (&filesys_lock);
   f->eax = filesys_remove (file_name);
-  lock_release (&filesys_lock);
 }
 
 // Open a file, assign it a file descriptor, and place
@@ -205,10 +221,8 @@ open_call (struct intr_frame *f, void **esp)
   const char *file_name = *(char **) get_argument (esp);
   check_pointer (file_name);
 
-  lock_acquire (&filesys_lock);
   struct file *file = filesys_open (file_name);
   f->eax = (file) ? init_file (file) : -1;
-  lock_release (&filesys_lock);
 }
 
 // Return the size of a file in bytes
@@ -219,11 +233,14 @@ filesize_call (struct intr_frame *f, void **esp)
   
   // Check if valid file descriptor
   if (fd < 2 || fd >= MAX_FILES) {
+    thread_current ()->exit_status = -1;	
+    thread_exit ();	
+  }else if (is_directory (fd))	
+  {
     thread_current ()->exit_status = -1;
     thread_exit ();
   }
 
-  lock_acquire (&filesys_lock);
   struct file *file = thread_current ()->files[fd];
 
   if (file)
@@ -234,7 +251,6 @@ filesize_call (struct intr_frame *f, void **esp)
     thread_current ()->exit_status = -1;
     thread_exit ();
   }
-  lock_release (&filesys_lock);
 }
 
 // If fd is 0, then read size bytes from stdin
@@ -278,18 +294,16 @@ read_call (struct intr_frame *f, void **esp)
     } else
     {
       // read from file with given fd
-      lock_acquire (&filesys_lock);
       struct file *file = thread_current ()->files[fd];
 
       // check if valid file
-      if (file)
+      if (file && !is_directory (fd))
       {
         f->eax = file_read (file, buffer, size); 
       } else
       {
         f->eax = -1;
       }
-      lock_release (&filesys_lock);
     }
   }
 }
@@ -338,7 +352,6 @@ write_call (struct intr_frame *f, void **esp)
     } else
     {
       // write to file given by fd
-      lock_acquire (&filesys_lock);
       struct file *file = thread_current ()->files[fd];
 
       // check if valid file
@@ -349,7 +362,6 @@ write_call (struct intr_frame *f, void **esp)
       {
         f->eax = -1;
       }
-      lock_release (&filesys_lock);
     }
   }
 }
@@ -362,6 +374,10 @@ seek_call (struct intr_frame *f UNUSED, void **esp)
 
   //Check if valid file descriptor
   if (fd < 2 || fd >= MAX_FILES)
+  {	
+    thread_current ()->exit_status = -1;	
+    thread_exit ();	
+  }else if (is_directory (fd))
   {
     thread_current ()->exit_status = -1;
     thread_exit ();
@@ -369,18 +385,15 @@ seek_call (struct intr_frame *f UNUSED, void **esp)
 
   off_t position = *(off_t *) get_argument (esp);
 
-  lock_acquire (&filesys_lock);
   struct file *file = thread_current ()->files[fd];
   // Check if valid file
   if (!file)
   {
-    lock_release(&filesys_lock);
     thread_current ()->exit_status = -1;
     thread_exit ();
   }
 
   file_seek (file, position);
-  lock_release (&filesys_lock);
 }
 
 /*Returns the position of the next byte in an open file to be read or written*/
@@ -394,9 +407,12 @@ tell_call (struct intr_frame *f, void **esp)
   {
     thread_current ()->exit_status = -1;
     thread_exit ();
+  }else if (is_directory (fd))	
+  {	
+    thread_current ()->exit_status = -1;	
+    thread_exit ();
   }
   
-  lock_acquire (&filesys_lock);
   struct file *file = thread_current ()->files[fd];
   // Check if valid file
   if (file)
@@ -406,7 +422,6 @@ tell_call (struct intr_frame *f, void **esp)
   {
     f->eax = -1;
   }
-  lock_release (&filesys_lock);
 }
 
 /*Close an open file represented by fd, only closes that specific instance and
@@ -423,11 +438,9 @@ close_call (struct intr_frame *f UNUSED, void **esp)
     thread_exit ();
   }
 
-  lock_acquire(&filesys_lock);
   struct file *file = thread_current ()->files[fd];
   if (!file)
   {
-    lock_release(&filesys_lock);
     thread_current ()->exit_status = -1;
     thread_exit ();
   }
@@ -440,5 +453,154 @@ close_call (struct intr_frame *f UNUSED, void **esp)
   {
     thread_current ()->next_fd = fd;
   }
-  lock_release(&filesys_lock);
+}
+
+		
+/* Changes a thread's current working directory to DIR.		
+   Accepts absolute and relative paths and the special 		
+   directory names "/", ".", and ".."		
+   Returns true if successful, false otherwise*/		
+static void 		
+chdir_call (struct intr_frame *f, void **esp) 		
+{		
+  char *dir = *(char **) get_argument (esp);		
+  check_pointer (dir);		
+  		
+  char *dir_name;		
+  struct dir *directory = parse_path(dir, &dir_name);		
+  if (!directory) {		
+    f->eax = 0;		
+  } else {  		
+    bool success = false;		
+    if (!strcmp (dir_name, ROOT) || !strcmp (dir_name, CURRENT_DIRECTORY)) 		
+    {		
+      //Change cwd to directory		
+      dir_close (thread_current ()->cwd);		
+      thread_current ()->cwd = directory;		
+      success = true;		
+    } else if (!strcmp (dir_name, PARENT_DIRECTORY))		
+    {		
+      //Change cwd to directory's parent directory		
+      dir_close (thread_current ()->cwd);		
+      thread_current ()->cwd = dir_open_parent (directory);		
+      dir_close (directory);		
+      success = true;		
+      		
+    } else {		
+      //Find the directory named DIR_NAME stored in DIRECTORY and make it cwd		
+      struct inode *inode;		
+      success = dir_lookup (directory, dir_name, &inode)		
+                  && inode_is_dir (inode);		
+      if (success) 		
+      {		
+        dir_close (thread_current ()->cwd);		
+        thread_current ()->cwd = dir_open (inode);		
+      }	
+      dir_close (directory);	
+    }	
+    	
+    free (dir_name);	
+    f->eax = success;	
+  }	
+}	
+
+/* Make a new directory named DIR	
+  Accepts absolute and relative paths and paths using the special names	
+  "/", ".", and ".." although it cannot make a directory with those names.	
+  If using a relative path, the new directory is created as a subdirectory	
+  of the cwd else it is the subdirectory of the directory found by parse_path.	
+  Returns true if successful, false otherwise*/	
+static void 	
+mkdir_call (struct intr_frame *f, void **esp) 	
+{	
+  char *dir = *(char **) get_argument (esp);	
+  check_pointer (dir);	
+  char *new_directory;	
+  struct dir *directory = parse_path (dir, &new_directory);	
+  if (!directory) 	
+  {	
+    f->eax = 0;	
+    	
+  } else 	
+  {	
+    block_sector_t inode_sector = 0;	
+    bool success = free_map_allocate (1, &inode_sector)	
+                    && dir_add (directory, new_directory, inode_sector)	
+                    && dir_create (inode_sector, 0,	
+                        inode_get_inumber (dir_get_inode (directory)));	
+    if (!success && inode_sector != 0)	
+    {	
+      free_map_release (inode_sector, 1);	
+    }	
+    free (new_directory);	
+    dir_close (directory);	
+    f->eax = success;	
+  }	
+}	
+
+/* Searches the directory known by FD for the next used directory entry.	
+   If a directory entry is found, return true and copy it's name into the	
+   NAME buffer. Else return false. 	
+   FD must refer to a directory*/	
+static void 	
+readdir_call (struct intr_frame *f, void **esp) 	
+{	
+  int fd = *(int *) get_argument (esp);	
+  if (fd < 2 || fd >= MAX_FILES)	
+  {	
+    f->eax = 0;	
+  }else if (!is_directory (fd))	
+  {	
+    f->eax = 0;	
+  }else	
+  {	
+    char *name = *(char **) get_argument (esp);	
+    check_pointer(name);	
+    struct file *file = thread_current ()->files[fd];	
+    struct dir *dir = dir_open (file_get_inode (file));	
+    if (!dir)	
+    {	
+      f->eax = 0;	
+    }else	
+    {	
+      dir_seek (dir, file_tell (file));	
+      bool success = dir_readdir (dir, name);	
+      if (success)	
+      {	
+        file_seek (file, dir_tell (dir));   	
+      }	
+      free (dir);	
+      f->eax = success;	
+    }	
+  }	
+}	
+
+// return true if the file represented by fd is a directory,	
+// false otherwise	
+static void 	
+isdir_call (struct intr_frame *f, void **esp)	
+{	
+  int fd = *(int *) get_argument (esp);	
+  if (fd < 2 || fd >= MAX_FILES)	
+  {	
+    f->eax = 0;	
+  }else	
+  {	
+    f->eax = is_directory (fd);	
+  }	
+}	
+
+// return the inode number of the file or directory represented	
+// by fd	
+static void 	
+inumber_call (struct intr_frame *f, void **esp) 	
+{	
+  int fd = *(int *) get_argument (esp);	
+  if (fd < 2 || fd >= MAX_FILES)	
+  {	
+    thread_current()->exit_status = -1;	
+    thread_exit ();	
+  }	
+  struct file *file = thread_current ()->files[fd];	
+  f->eax = inode_get_inumber (file_get_inode (file));	
 }
